@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: fx-engine-postgres
+    ports:
+      # Non-default host port to avoid colliding with any local Postgres.
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: fx_engine
+      POSTGRES_USER: fx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD env var required}
+    volumes:
+      - fx_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fx -d fx_engine"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  fx_pg_data:
