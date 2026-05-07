@@ -318,3 +318,81 @@ compare quote_ids. Different quote_id -> 409 returned to caller; no
 new execution row written. Same quote_id -> stored response_body
 returned with HTTP 200 (the byte-identical replay path).
 
+## Step 4 — rate provider
+
+### Step 4 was scoped down at the engineer's instruction
+**Decision owner:** Engineer override of AI's bundled scope.
+**AI proposal:** Bundle rate provider + FastAPI routes + observability
++ Hypothesis property tests + load test in one step.
+**Engineer override:** Rate provider only. API + observability +
+property tests + load test in step 5.
+**Why:** A bundled commit would have been ~4,000+ lines and the
+history loses its narrative. The rate provider has a non-trivial
+state machine (circuit breaker) and a coalescer that warrant
+isolation. If a state-transition bug existed, surfacing it in step
+4 (where the only thing under test is the provider) is much cheaper
+than surfacing it in step 5 inside an API test failure.
+**Lesson:** When a step's scope crosses ~3,000 lines or two
+unrelated risk surfaces, split it.
+
+### Circuit breaker: half-open admits one trial via in-progress flag
+**Decision owner:** AI proposed.
+**Why:** SPEC §8 says "one trial request" in HALF_OPEN. Naive
+implementations forward every concurrent caller during the half-
+open window, which means three concurrent retries can turn a single
+"is the upstream back?" probe into three real upstream calls --
+defeating the breaker's whole point. The implementation reserves
+the trial slot with `_half_open_in_progress = True` inside the
+state lock; subsequent callers see the flag and raise
+`OpenCircuitError`. On trial completion (success -> CLOSED, failure
+-> OPEN with reset cooldown) the flag is cleared.
+**Tested in isolation:** A held `asyncio.Event` keeps the trial
+in flight; concurrent `cb.call(_ok)` calls raise `OpenCircuitError`
+without invoking the wrapped fn. Verified by counter -- exactly one
+invocation across three concurrent calls.
+
+### Singleflight uses asyncio.Future per key, not Event + stored result
+**Decision owner:** AI proposed.
+**Why:** Future is the right primitive: it carries the result (or
+exception) and supports `await` directly. With Event-and-stored-
+result you'd recreate the future-of-T pattern by hand. The
+implementation runs the fetch in a separately-spawned `create_task`
+so a caller's `wait_for` timeout cancels only the caller's await --
+the underlying fetch continues and its result is still available
+to other waiters that haven't timed out.
+**Strong task references:** RUF006 caught a real footgun -- raw
+`asyncio.create_task(...)` returns a task that can be garbage-
+collected if no reference is kept, killing the work mid-flight.
+The fix is to keep tasks in a `set` and remove on `done_callback`.
+
+### Cache layer owns its own session_factory
+**Decision owner:** AI proposed.
+**Why:** The rates table is the rate provider's private store; the
+API layer asks `RateProvider.get_rate(base, quote)` and doesn't pass
+a session in. Cache reads/writes are independent transactions from
+quote creation -- a quote insert in transaction A shouldn't see
+half-finished cache state from rate-refresh transaction B. The
+clean separation also lets the scheduler run with its own session
+context without entangling the API request flow.
+
+### Scheduler is asyncio-native: `create_task` start, `Event` + cancel stop
+**Decision owner:** AI proposed (per engineer's no-threads constraint).
+**Why:** No `threading.Lock`, no `concurrent.futures.ThreadPool`.
+`start()` spawns the loop task; `stop()` sets `_stopped`, cancels
+the task, and awaits its `CancelledError` for clean shutdown. The
+loop iterates pairs sequentially per cycle and continues on per-pair
+failure, so one bad pair (e.g., a single 502 from upstream) does
+not kill the periodic refresh.
+**Stop is idempotent:** Calling `stop()` twice is a no-op, not an
+error -- a deliberate choice so FastAPI's lifespan handler in step
+5 can call stop on shutdown without juggling task state.
+
+### Provider does NOT write to cache when fetch fails
+**Decision owner:** AI proposed.
+**Why:** On fetch failure, the cache stays at whatever value it
+held before. The provider returns the cached value with its actual
+staleness tier; `STALE_UNUSABLE` becomes HTTP 503 in step 5's API.
+This is what SPEC §8 calls "fail closed when cache is too stale".
+The breaker's open state is also reflected in the same
+fall-through-to-cache path, with the same tier classification.
+
