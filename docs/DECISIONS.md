@@ -216,3 +216,105 @@ integration `conftest.py` does a 2-second `SELECT 1` probe at
 collection time and applies `pytest.mark.skipif` to the whole
 module if it fails. `make test-integration` brings up compose first,
 so the probe always succeeds in that flow.
+
+## Step 3 — quotes, executions, ledger + execute orchestrator
+
+### Balance arithmetic question (from step 1) — answer
+**Decision owner:** Engineer asked at step 3 to revisit; AI answered.
+**Outcome:** Keep `Balance(1) - Balance(3)` raising at construction.
+The execute orchestrator works with ORM `Balance` rows whose
+`amount` is `Decimal`, **not** with the domain `Balance` value
+object. The ORM-level arithmetic (`row.amount = row.amount + money.amount`)
+is where balance changes happen; the domain `Balance` type guards
+construction-time invariants on Python objects flowing through pure
+domain code, where "subtract a balance to go negative" is genuinely
+an error. The two layers don't interfere.
+**Lesson:** The "this might cause friction in execute" flag from
+step 1 turned out to be a false alarm. Documented with the resolved
+status so it doesn't get re-litigated later.
+
+### Circular FK between quotes and executions: ORM-only on one side
+**Decision owner:** AI proposed; engineer to review.
+**Why:** SPEC §4 has `quotes.consumed_by_execution_id` referencing
+`executions.id` *and* `executions.quote_id` referencing `quotes.id`.
+Postgres can model this with `DEFERRABLE INITIALLY DEFERRED`; SQLite
+cannot. Adding the second FK at the DB level would require batch-
+mode `ALTER` on SQLite, which complicates the migration without
+real safety gain.
+**Resolution:** Keep `executions.quote_id -> quotes.id` as a DB FK
+(the strong direction; an execution must always reference an
+existing quote). For `quotes.consumed_by_execution_id ->
+executions.id`, declare the relationship at the ORM layer only.
+The integrity argument: the only writer is the execute orchestrator,
+which sets `consumed_by_execution_id` in the same transaction that
+inserted the executions row. A future bug that bypasses the
+orchestrator would be the only way to write a stale value, and a
+DB constraint there wouldn't have caught the *existence* problem
+anyway -- it would just have made the migration uglier.
+
+### Partial unique index on `executions.quote_id WHERE status='succeeded'`
+**Decision owner:** SPEC §4 (engineer); AI verified portability.
+**Verification:** Both Postgres and SQLite (>= 3.8) support partial
+unique indexes natively. The `Index(...)` declaration uses
+`postgresql_where=` and `sqlite_where=` so SQLAlchemy emits the
+right DDL on each backend. Fresh upgrade-then-introspect on SQLite
+showed the index `ix_executions_quote_succeeded` was created with
+the WHERE clause intact -- no domain-level fallback needed.
+**Why it's defence-in-depth, not the primary serialisation point:**
+The race we're guarding against -- two parallel executes trying to
+mark the same quote consumed -- is serialised by `SELECT ... FOR
+UPDATE` on the quote row. The partial index is the backstop in
+case a future bug reaches commit time without holding that lock;
+it would convert a silent corruption into a loud `IntegrityError`.
+
+### Pending-execution placeholder pattern: insert with `status='failed'`, update on success
+**Decision owner:** AI proposed.
+**Why:** The orchestrator must insert the executions row early so
+the unique constraint on `(customer_id, idempotency_key)` catches
+replay attempts. But "succeeded" and "failed" are the only valid
+statuses (no "in_flight"), so we can't insert a neutral marker.
+Inserting with `status='failed'` keeps the row outside the partial
+unique index's match set; the orchestrator updates to `succeeded`
+once business logic clears. Concurrent executes on the same quote
+both insert `failed` placeholders, neither hits the partial index,
+and the FOR UPDATE lock on the quote serialises the actual mutation.
+
+### `response_body` assembled inside the transaction from post-flush ORM values
+**Decision owner:** Engineer's hard requirement (AC #3); AI implemented.
+**Why:** The replay path returns the persisted `response_body`
+verbatim. If the body were assembled *after* commit -- e.g. by a
+fresh `SELECT balances` -- replay would return a stale snapshot.
+**How:** `BalanceRepository.debit/credit` flushes the UPDATE before
+returning the ORM row, so `row.amount` already reflects the post-
+update value. The orchestrator reads `debited_row.amount` and
+`credited_row.amount` directly into the response_body dict, then
+calls `ExecutionRepository.finalize_succeeded` which writes the
+dict to the row. The whole sequence runs inside the caller's
+`async with session.begin():`, so commit happens after the body
+is persisted.
+**Note on UPDATE RETURNING:** Postgres supports it explicitly; we
+don't use `.returning()` because SQLAlchemy ORM's flush already
+gives us the post-update value via the ORM identity map. The
+contract -- "response body reflects post-update state, persisted
+in the same transaction" -- is met either way.
+
+### Atomicity test uses `monkeypatch` to inject a credit-leg fault
+**Decision owner:** AI proposed.
+**Why:** SPEC §12 requires demonstrating that a credit-leg failure
+rolls back the debit. A real fault (e.g., DB connection drop) is
+hard to provoke deterministically. Patching `BalanceRepository.credit`
+to raise on a specific currency gives a reproducible, fast test.
+The patch is reverted via `monkeypatch.undo()` before the retry
+half of the test, which verifies the idempotency key is *not*
+sticky after a DB-level rollback.
+
+### Idempotency-key-reused-with-different-quote: 409, no DB write
+**Decision owner:** SPEC §6/§10; AI implemented.
+**Why:** This is the one path where SPEC says "no persistent state
+change" on failure. The orchestrator enters a SAVEPOINT, fails on
+the unique constraint, and the SAVEPOINT auto-rolls back. We then
+read the existing row (from the outer transaction's view) and
+compare quote_ids. Different quote_id -> 409 returned to caller; no
+new execution row written. Same quote_id -> stored response_body
+returned with HTTP 200 (the byte-identical replay path).
+

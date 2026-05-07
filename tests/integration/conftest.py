@@ -100,7 +100,14 @@ async def engine(postgres_url: str) -> AsyncIterator[AsyncEngine]:
         yield eng
     finally:
         async with eng.begin() as conn:
-            await conn.execute(text("TRUNCATE balances, customers, rates RESTART IDENTITY CASCADE"))
+            # CASCADE chains through ledger_entries -> executions -> quotes
+            # -> customers/balances. Listed leaf-first for readability.
+            await conn.execute(
+                text(
+                    "TRUNCATE ledger_entries, executions, quotes, "
+                    "balances, customers, rates RESTART IDENTITY CASCADE"
+                )
+            )
         await eng.dispose()
 
 

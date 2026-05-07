@@ -8,11 +8,17 @@ in the API layer use ``session_scope`` from ``app.infra.db``.
 
 from app.infra.repositories.balance import BalanceRepository, InsufficientBalance
 from app.infra.repositories.customer import CustomerRepository
+from app.infra.repositories.execution import ExecutionRepository
+from app.infra.repositories.ledger import LedgerRepository
+from app.infra.repositories.quote import QuoteRepository
 from app.infra.repositories.rate import RateRepository
 
 __all__ = [
     "BalanceRepository",
     "CustomerRepository",
+    "ExecutionRepository",
     "InsufficientBalance",
+    "LedgerRepository",
+    "QuoteRepository",
     "RateRepository",
 ]

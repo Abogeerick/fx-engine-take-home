@@ -20,6 +20,17 @@ class Base(DeclarativeBase):
 # on Base.metadata. Order does not matter for metadata registration.
 from app.infra.models.balance import Balance  # noqa: E402
 from app.infra.models.customer import Customer  # noqa: E402
+from app.infra.models.execution import Execution  # noqa: E402
+from app.infra.models.ledger_entry import LedgerEntry  # noqa: E402
+from app.infra.models.quote import Quote  # noqa: E402
 from app.infra.models.rate import Rate  # noqa: E402
 
-__all__ = ["Balance", "Base", "Customer", "Rate"]
+__all__ = [
+    "Balance",
+    "Base",
+    "Customer",
+    "Execution",
+    "LedgerEntry",
+    "Quote",
+    "Rate",
+]
