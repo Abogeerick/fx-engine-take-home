@@ -100,3 +100,119 @@ CLAUDE.md §7).
 require modifications (which we cannot make) or generate noise on
 every `make lint` run. `extend-exclude = ["planted_bugs", ".venv"]`
 in `[tool.ruff]`.
+
+## Step 2 — persistence layer
+
+### Repository signature: `credit/debit(session, customer_id, money)`, no separate `currency` arg
+**Decision owner:** AI override of engineer's listed signature.
+**Engineer's listing (informal):** `credit(customer_id, currency, money)`.
+**Implementation:** `credit(session, customer_id, money: Money)`.
+**Why:** ``Money`` already carries its currency. A separate
+``currency`` parameter invites mismatch-vs-payload checks for no
+real benefit -- the type system already enforces consistency.
+Documented for engineer review; revert if explicit double-spec is
+preferred.
+
+### `StalenessTier` lives in `app/domain/staleness.py`, not `app/infra/`
+**Decision owner:** Engineer (in step-2 instructions); AI executed.
+**Why:** Tier classification is business logic -- the thresholds
+(60s fresh, 10 min stale-unusable) drive HTTP status codes and
+quoting decisions per SPEC §8. The repository imports `classify`
+from the domain, not the other way around. Confirms the dependency
+direction the layout enforces.
+
+### `UtcDateTime` TypeDecorator added (extra file `app/infra/models/types.py`)
+**Decision owner:** AI flagged, engineer to review.
+**Why:** `DateTime(timezone=True)` does not round-trip `tzinfo`
+through SQLite -- writes accept tz-aware datetimes but reads return
+naive ones. The application contract per ``Clock`` is "always
+UTC-aware on the way in", so the `process_result_value` hook
+re-attaches UTC. On Postgres the `TIMESTAMPTZ` column already
+carries tz; the decorator is a no-op there.
+**Detection story:** caught by the strict `classify()` guard in
+`app/domain/staleness.py` -- it raises on naive datetimes. Without
+that guard the bug would have manifested later as silently-wrong
+freshness classifications on SQLite.
+
+### Migration test caught by AC #1: `env.py` was overriding test-supplied URL
+**Decision owner:** AI bug, engineer's AC #1 caught it.
+**What broke:** `alembic/env.py` initially read `_settings = get_settings()`
+at module load and unconditionally wrote that URL to the alembic
+Config (`config.set_main_option("sqlalchemy.url", _settings.database_url)`).
+That overrode any URL the test fixture set on the Config, so the
+migration ran against the default `:memory:` SQLite DB while the
+test queried a tmp-file DB -- alembic logged "Running upgrade ->
+0001_initial_schema" but the tmp file stayed empty.
+**Fix:** Inverted priority -- prefer the URL on the alembic Config
+over `get_settings().database_url`. Settings is now the fallback for
+plain `alembic upgrade head` from the CLI. Captured as a
+`_resolve_url()` helper used by both online and offline migration
+paths.
+**Lesson:** AC #1 was load-bearing. Without "migration must run
+cleanly on both backends" as an explicit test, this bug would have
+surfaced in step 3 when the test for sticky idempotent failures
+tried to insert into a non-existent `executions` row.
+
+### CHECK-constraint test fix: SA Core `insert(...)` instead of `text(...)` with str(uuid)
+**Decision owner:** AI bug, the test caught itself.
+**What broke:** I tried to test the CHECK constraint with raw
+`text("UPDATE balances SET amount = -1 WHERE customer_id = :cid")`
+binding `str(uuid)`. SQLAlchemy's `Uuid()` type stores as 16-byte
+BLOB on SQLite; the string parameter never matched, the UPDATE
+affected zero rows, and the test reported a green CHECK constraint
+that had never actually been exercised.
+**Fix:** Switch to SA Core `insert(BalanceTable).values(...)` so the
+type adapter binds the UUID correctly across both dialects.
+**Lesson:** "Test passed" is not the same as "DB rejected the bad
+input". When a test relies on the DB to enforce something, verify
+the test actually reaches the DB layer with the expected payload.
+
+### SQLite resource-leak from `with sqlite3.connect(...)`
+**Decision owner:** Engineer's strict-warnings config caught it.
+**What broke:** `with sqlite3.connect(db) as conn:` manages the
+*transaction*, not the connection lifetime -- the file handle stays
+open until garbage collection. Strict `filterwarnings = ["error"]`
+escalated the resulting `ResourceWarning` to a test-collection error
+on a downstream test (the unraisable warning fired during the
+*next* test's setup, so the failure looked unrelated).
+**Fix:** Wrap in `contextlib.closing(...)` so connections close
+deterministically.
+**Lesson:** This is exactly why CLAUDE.md keeps `filterwarnings`
+strict -- a real leak that would have shown up under load surfaced
+on the first test run instead.
+
+### SQLite `FOR UPDATE` is a no-op; correctness preserved by file-level write serialization
+**Decision owner:** AI proposed (per engineer's watch-list item);
+engineer approved.
+**Why:** SQLite has no row-level locking. SQLAlchemy generates the
+`FOR UPDATE` clause on Postgres dialects and silently omits it on
+SQLite. Concurrent writers serialize at the database file level,
+which is correct (no torn writes) but worse for throughput. SQLite
+tier tests don't exercise blocking semantics; the Postgres
+integration test does, with two concurrent sessions and an
+asyncio-timestamped assertion that B doesn't complete until A's
+hold elapses.
+
+### Per-test cleanup pattern: `DELETE FROM` on SQLite, `TRUNCATE` on Postgres
+**Decision owner:** AI proposed.
+**Why:** SQLite has no `TRUNCATE`. The cleanup ordering matters
+because `balances.customer_id` is FK to `customers`. Postgres
+supports `TRUNCATE balances, customers, rates RESTART IDENTITY
+CASCADE` in a single statement, which is faster and avoids the
+ordering question.
+
+### Test database: `fx_engine_test`, auto-created from the `postgres` admin DB
+**Decision owner:** AI proposed.
+**Why:** Keeps integration test data isolated from a developer's
+`fx_engine` dev DB. The session-scoped fixture creates the test DB
+(if absent) by connecting to the always-present `postgres` system DB
+in AUTOCOMMIT mode and running `CREATE DATABASE`. Cheap and idempotent.
+
+### Module-level skip when Postgres unreachable
+**Decision owner:** AI proposed.
+**Why:** A developer running `make test-unit` shouldn't see noise
+from a separate compose stack they didn't intend to start. The
+integration `conftest.py` does a 2-second `SELECT 1` probe at
+collection time and applies `pytest.mark.skipif` to the whole
+module if it fails. `make test-integration` brings up compose first,
+so the probe always succeeds in that flow.

@@ -1,4 +1,4 @@
-.PHONY: up down test test-unit lint format typecheck
+.PHONY: up down test test-unit test-integration migrate lint format typecheck
 
 up:
 	docker compose up -d
@@ -6,11 +6,19 @@ up:
 down:
 	docker compose down
 
-test:
-	python -m pytest
+# Run unit + integration. test-integration brings up Postgres if it
+# isn't already running, so this works from a cold start.
+test: test-unit test-integration
 
 test-unit:
 	python -m pytest tests/unit
+
+test-integration:
+	docker compose up -d --wait postgres
+	python -m pytest tests/integration
+
+migrate:
+	python -m alembic upgrade head
 
 lint:
 	python -m ruff check .
