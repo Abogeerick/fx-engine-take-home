@@ -499,3 +499,83 @@ JSON-serialisable -> 500 instead of 400 on malformed input.
 detail in the response but JSON-clean. The test
 `test_post_quote_lowercase_currency_rejected` is what surfaced it.
 
+## Step 6 — planted_bugs review
+
+### Tools used
+* Claude Code (this assistant) for inspection and drafting
+  reproductions. The agent read every file line by line, formed
+  hypotheses one-sentence-at-a-time before verifying, and produced
+  the scratch reproductions.
+* Python interactive shell for empirical probes (e.g., the random
+  search across 50,000 (amount, rate) pairs to look for float-vs-
+  Decimal divergence at 2dp).
+* The planted suite's own pytest run, to confirm the baseline claim
+  that it passes despite the bugs.
+* A `scratch/` directory at the project root holding one
+  reproduction script per hypothesis; gitignored, not committed.
+  Each script either fires the bug it targets or fails silently --
+  hypotheses that don't reproduce don't make it to REVIEW.md.
+
+### One bug I initially suspected but almost demoted to a tentative observation
+**Bug #7 (float arithmetic in generate_quote).** My first empirical
+probe was a random search across 50,000 (amount, rate) pairs in
+typical Umba ranges, looking for inputs where the float-then-Decimal
+path diverged from pure Decimal at 2-decimal-place rounding. **Zero
+divergent cases.** I almost demoted the bug to a tentative observation
+on the grounds that "in practice the 2-dp rounding masks every float
+error at realistic scale."
+
+The recovery: I realised the SPEC §3 hard rule "no floats for money"
+is unconditional. The bug is using floats, regardless of whether the
+rounded outputs ever observably differ. I then pushed the search into
+larger amount territory and found a divergence at ~1.2 quadrillion
+(0.15 USD difference), but the real argument for keeping the bug is
+the SPEC violation plus the asymmetry with `execute_quote` (which
+uses pure Decimal). The two paths produce different `final_amount`
+values for the same inputs, which combined with Bug #4 (execute
+recomputes) means the customer can see a different number on the
+quote vs the executed transaction even when rates haven't moved.
+
+**Lesson:** "Empirical search didn't surface a divergence" is not the
+same as "the bug doesn't exist." When a SPEC has a hard rule, the
+violation is the bug; downstream observability of the divergence is
+about *probability*, not *existence*. I was about to make a
+false-negative call; the spec rescued me.
+
+### The bug I'm proudest of finding
+**Bug #1 (cross-pair routing math inverted).** Two reasons.
+
+First, it's the most catastrophic single defect in the planted code.
+A 100 KES → NGN trade returns 19,358,139 NGN -- about 17,000× the
+correct value. A real fintech that shipped this would lose its
+operating capital in hours. The bug isn't subtle; it's a complete
+mathematical inversion. But it's also not the kind of thing that
+shows up in a casual code review because the formula
+`leg1["sell"] * leg2["sell"]` *looks* like a reasonable cross-rate
+composition until you notice the units don't match.
+
+Second, this bug survived the planted suite's own
+`test_inverse_pair_calculation` test -- which uses a `MagicMock`
+provider with synthetic rates and only asserts `rate > 0`. A passing
+test that doesn't exercise the failure mode is worse than no test
+because it gives false confidence. This bug surviving its test is
+itself a story about coverage discipline.
+
+### What surprised me about the planted code
+The eight passing tests test only the happy path (`generate_quote`
+returns expected shape, `execute_quote` succeeds) and obvious
+negatives (zero amount, same currency, unknown id). **No test
+exercises**: concurrent execute, rate movement during the TTL,
+idempotency-key reuse with different quotes, cross-pair routing
+producing realistic numbers, HTTP status code differentiation, or
+the `X-Correlation-ID` echo contract. Six of the nine bugs survive
+because their failure modes are simply not reached by the test
+suite.
+
+This is the lesson the assignment is teaching: **AI-generated code
+will produce a test suite that exercises the AI's mental model of
+the code, not the spec's actual contract.** The reviewer's job is to
+ask "what isn't tested?" and probe those gaps. Five of the nine bugs
+in REVIEW.md correspond to coverage gaps in the planted suite. The
+review is more about the test gaps than the code itself.
+
