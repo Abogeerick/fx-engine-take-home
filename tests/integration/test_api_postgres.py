@@ -50,27 +50,37 @@ class _FakeSource:
 
 @pytest_asyncio.fixture
 async def api_client(monkeypatch, postgres_url: str) -> AsyncIterator[AsyncClient]:
-    """Build the app, swap the rate source for a fake, drive lifespan."""
+    """Build the app with the rate source faked from the start.
+
+    The fake source must be installed BEFORE ``create_app()`` runs.
+    Otherwise the scheduler's first iteration -- which kicks off inside
+    lifespan startup -- will already have spawned a fetch against the
+    real httpx upstream with no API key, hitting a ~5-second timeout
+    that may outlive the test. Tests should not hit real networks.
+    """
     monkeypatch.setenv("DATABASE_URL", postgres_url)
     monkeypatch.setenv("ENV", "test")
-    # Ensure get_settings() rebuilds with the patched env.
     from app.infra.config import get_settings
 
     get_settings.cache_clear()
 
+    # Replace ExchangeRatesApiSource in the api_main namespace BEFORE
+    # create_app() runs, so the lifespan's source construction returns
+    # the fake instead of the real httpx-backed source.
+    import app.api.main as api_main
+
+    def _fake_source_factory(**_kwargs: object) -> _FakeSource:
+        return _FakeSource()
+
+    monkeypatch.setattr(api_main, "ExchangeRatesApiSource", _fake_source_factory)
+
     app = create_app()
     transport = ASGITransport(app=app)
     async with app.router.lifespan_context(app):
-        # Swap the rate provider's source to the fake AFTER lifespan has
-        # constructed the provider.
-        app.state.rate_provider._source = _FakeSource()  # type: ignore[attr-defined]
         try:
             async with AsyncClient(transport=transport, base_url="http://test") as client:
                 yield client
         finally:
-            # The api_client fixture builds its own engine via lifespan;
-            # truncate so subsequent tests in the integration suite don't
-            # see leftover state.
             from sqlalchemy import text
 
             async with app.state.engine.begin() as conn:

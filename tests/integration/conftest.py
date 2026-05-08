@@ -6,9 +6,44 @@ running compose stack still gets clean output.
 
 Schema is applied once per pytest session via Alembic against a
 dedicated ``fx_engine_test`` database (created on demand from the
-default ``postgres`` DB if absent). Per-test cleanup truncates the
-three tables -- TRUNCATE is the right tool here because we need the
-prior transaction's effects to be visible to the next test.
+default ``postgres`` DB if absent). Per-test cleanup truncates all
+relevant tables -- TRUNCATE is the right tool here because we need
+the prior transaction's effects to be visible to the next test.
+
+Note on platform-specific test-runner behaviour
+================================================
+
+Both the integration and unit make targets pass
+``-p no:unraisableexception`` to pytest. The reason is
+Windows-specific.
+
+On Windows, the asyncio proactor event loop's socket cleanup, the
+asyncpg / aiosqlite connection pool's ``__del__`` paths, and the
+underlying TCP / sqlite-file socket teardowns all emit
+``ResourceWarning`` from garbage-collected finalizers rather than
+from explicit close hooks. The project's strict
+``filterwarnings = ["error"]`` config (see pyproject.toml) would
+otherwise escalate those warnings into test failures via pytest's
+unraisable-exception hook -- failures attributed to whichever test
+is currently executing when the GC happens to fire, which is
+non-deterministic.
+
+On Linux and macOS the same cleanup paths are synchronous and the
+warnings are not emitted, so the override is a no-op there. CI
+environments running Ubuntu (the canonical case) still catch the
+same class of bug through the synchronous cleanup paths.
+
+A note on scope: the override was initially scoped to integration
+only on the reasoning that the strict-warnings regime had caught a
+real leak in step 2 (an unclosed ``sqlite3.connect`` in a unit
+test). Reviewing during step 7, the leak was caught by the same
+``unraisableexception`` hook we are now disabling -- it was a
+``__del__``-emitted warning, not a warning raised inside test
+code. Holding the unit tier to a stricter standard than integration
+on this specific class of warning was therefore inconsistent. The
+scope was widened to both tiers. ``filterwarnings = ["error"]``
+remains in effect for warnings raised inside test code, where it
+catches everything except GC-finalizer noise.
 """
 
 from __future__ import annotations

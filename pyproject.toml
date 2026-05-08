@@ -61,4 +61,13 @@ strict = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-filterwarnings = ["error"]
+# Strict regime for warnings raised inside test code; one narrow
+# ignore for PytestUnraisableExceptionWarning, which catches
+# GC-finalizer ResourceWarnings from asyncio proactor / asyncpg /
+# aiosqlite cleanup paths on Windows. See tests/integration/conftest.py
+# header for the platform-noise-scoping rationale. On Linux/macOS the
+# cleanup paths are synchronous and the ignore is a no-op.
+filterwarnings = [
+    "error",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]

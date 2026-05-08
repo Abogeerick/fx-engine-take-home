@@ -11,11 +11,14 @@ down:
 test: test-unit test-integration
 
 test-unit:
-	python -m pytest tests/unit
+	# -p no:unraisableexception: see tests/integration/conftest.py
+	# header. Same Windows-specific GC-finalizer cleanup applies to
+	# aiosqlite in unit tier as it does to asyncpg in integration tier.
+	python -m pytest tests/unit tests/property -p no:unraisableexception
 
 test-integration:
 	docker compose up -d --wait postgres
-	python -m pytest tests/integration
+	python -m pytest tests/integration -p no:unraisableexception
 
 migrate:
 	python -m alembic upgrade head
