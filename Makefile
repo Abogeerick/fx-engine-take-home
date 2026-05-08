@@ -1,4 +1,4 @@
-.PHONY: up down test test-unit test-integration migrate lint format typecheck
+.PHONY: up down test test-unit test-integration migrate serve load-test lint format typecheck
 
 up:
 	docker compose up -d
@@ -19,6 +19,12 @@ test-integration:
 
 migrate:
 	python -m alembic upgrade head
+
+serve:
+	python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+
+load-test:
+	python scripts/load_test.py --customers 10 --quotes-per-customer 5
 
 lint:
 	python -m ruff check .

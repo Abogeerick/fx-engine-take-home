@@ -6,31 +6,62 @@ wraps the call. Inside, it uses ``begin_nested()`` (SAVEPOINT) for the
 idempotency-conflict check so an ``IntegrityError`` on the unique
 constraint can be recovered without poisoning the outer transaction.
 
-Step sequence per SPEC §7
-=========================
+Step sequence (mapped to SPEC §7 with one deviation, see below)
+================================================================
 
 1. (Caller)  begin transaction.
-2. Insert into ``executions`` with ``(customer_id, idempotency_key)``
+2. ``SELECT ... FOR UPDATE`` on the quote row. (See deviation note.)
+   - if not found: return 404. No executions row written; the FK
+     would prevent it anyway, so quote-not-found is non-sticky.
+3. Insert into ``executions`` with ``(customer_id, idempotency_key)``
    inside a SAVEPOINT. The unique constraint detects replays:
      - Same key, same quote_id  -> read existing, return its
        response_body with HTTP 200 (replay).
      - Same key, different quote_id -> HTTP 409 (idempotency reuse).
-3. ``SELECT ... FOR UPDATE`` on the quote row. Validate, in order:
-     a. ``quote.customer_id == request.customer_id``  (else 404)
-     b. ``consumed_at IS NULL``                       (else 409)
-     c. ``expires_at > now``                          (else 410)
-4. ``SELECT ... FOR UPDATE`` on the two balance rows in alphabetical
+4. Validate quote, in order:
+     a. ``quote.customer_id == request.customer_id``  (else 404, sticky)
+     b. ``consumed_at IS NULL``                       (else 409, sticky)
+     c. ``expires_at > now``                          (else 410, sticky)
+5. ``SELECT ... FOR UPDATE`` on the two balance rows in alphabetical
    currency order to prevent deadlocks under cross-direction swaps.
-5. Validate ``from_balance >= from_amount``           (else 422).
-6. Update balances: debit from-currency, credit to-currency.
-7. Insert two ledger entries (signed: debit negative, credit positive).
-8. Update quote: set ``consumed_at``, ``consumed_by_execution_id``.
-9. Build ``response_body`` from the post-update balance values
-   (``debit/credit`` repository methods return ORM rows whose
-   ``amount`` is already the post-flush value -- no separate read,
-   no read-after-commit). Persist ``response_body`` and
-   ``status='succeeded'`` on the executions row.
-10. (Caller) commit.
+6. Validate ``from_balance >= from_amount``           (else 422, sticky).
+7. Update balances: debit from-currency, credit to-currency.
+8. Insert two ledger entries (signed: debit negative, credit positive).
+9. Update quote: set ``consumed_at``, ``consumed_by_execution_id``.
+10. Build ``response_body`` from the post-update balance values
+    (``debit/credit`` repository methods return ORM rows whose
+    ``amount`` is already the post-flush value -- no separate read,
+    no read-after-commit). Persist ``response_body`` and
+    ``status='succeeded'`` on the executions row.
+11. (Caller) commit.
+
+Deviation from SPEC §7 step ordering
+=====================================
+
+SPEC §7 lists "insert executions" before "SELECT FOR UPDATE on quote".
+This implementation **swaps those two steps** because the literal
+SPEC ordering deadlocks on Postgres under N concurrent executes.
+
+The reason: inserting into ``executions`` takes a ``FOR KEY SHARE``
+lock on the FK-referenced ``quotes`` row. Two parallel transactions
+both acquire compatible KEY SHARE locks on the same quote row; both
+then try to upgrade to ``FOR UPDATE`` at step 3, which is incompatible
+with KEY SHARE held by another transaction -- mutual deadlock.
+
+By taking ``FOR UPDATE`` on the quote first, parallel executes
+serialise on that exclusive lock immediately. The subsequent insert
+takes its FK lock on a row this transaction already holds exclusively,
+and there is no upgrade involved.
+
+All observable behaviours from SPEC §7 are preserved:
+  * Idempotent replay still works (same key -> same response).
+  * Sticky failures still recorded (insert happens after lock, before
+    business-logic validation).
+  * Quote-not-found still 404 with no DB write (FK would prevent the
+    insert otherwise; we short-circuit before the insert as well).
+  * Different quote_id with same key still 409 with no DB write.
+
+This deviation is documented in DECISIONS.md.
 
 Outcomes
 ========
@@ -103,7 +134,25 @@ async def execute_quote(
     now = clock.now()
     new_execution_id = uuid4()
 
-    # --- step 2: insert pending execution inside SAVEPOINT --------------
+    # --- step 2: lock quote BEFORE inserting executions -----------------
+    # See module docstring -- this is the SPEC §7 deviation that avoids
+    # a Postgres FK-vs-FOR UPDATE deadlock under N parallel executes.
+    quote = await QuoteRepository.get_for_update(session, request.quote_id)
+    if quote is None:
+        # Quote-not-found is non-sticky: the FK from executions.quote_id
+        # would prevent us from inserting an executions row anyway.
+        return ExecuteOutcome(
+            response_body={
+                "quote_id": str(request.quote_id),
+                "status": "failed",
+                "failure_reason": FailureReason.QUOTE_OWNERSHIP_MISMATCH.value,
+                "message": "quote not found",
+            },
+            http_status=404,
+            is_replay=False,
+        )
+
+    # --- step 3: insert pending execution inside SAVEPOINT --------------
     try:
         async with session.begin_nested():
             new_execution = await ExecutionRepository.insert_pending(
@@ -117,19 +166,7 @@ async def execute_quote(
     except IntegrityError:
         return await _handle_idempotency_conflict(session, request)
 
-    # --- step 3: lock quote and validate --------------------------------
-    quote = await QuoteRepository.get_for_update(session, request.quote_id)
-    if quote is None:
-        # FK enforces this can't happen for the quote_id we just inserted,
-        # but be defensive.
-        return await _record_failure(
-            session,
-            new_execution,
-            failure_reason=FailureReason.QUOTE_OWNERSHIP_MISMATCH,
-            http_status=404,
-            message="quote not found",
-        )
-
+    # --- step 4: validate quote (we already hold FOR UPDATE on it) ------
     if quote.customer_id != request.customer_id:
         return await _record_failure(
             session,
