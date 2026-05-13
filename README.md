@@ -27,28 +27,110 @@ The artefacts to read, in this order:
 
 ## Quick start
 
+Requires **Python 3.13** (the venv was developed and tested on 3.13;
+3.14 hits a pytest-asyncio deprecation that's unrelated to this
+project). Docker is required for the integration tier.
+
 ```bash
-git clone <repo-url>
-cd fx_takehome_candidate/fx_takehome
-python -m venv .venv && .venv/Scripts/activate     # Windows
-# or:                  source .venv/bin/activate    # POSIX
+git clone https://github.com/Abogeerick/fx-engine-take-home.git
+cd fx-engine-take-home
+
+# Create venv on Python 3.13. On Windows use `py -3.13`; on POSIX
+# use `python3.13` (or whatever your launcher names it).
+py -3.13 -m venv .venv                            # Windows
+# or:
+python3.13 -m venv .venv                          # macOS / Linux
+
+# Activate:
+.venv\Scripts\activate                            # Windows (cmd)
+source .venv/Scripts/activate                     # Windows (Git Bash)
+source .venv/bin/activate                         # macOS / Linux
 
 pip install -e ".[dev]"
 
+# Bring up Postgres for the integration tier.
 POSTGRES_PASSWORD=devpass docker compose up -d --wait postgres
-make test
 ```
 
-Expected output: 120 tests pass across unit (97) and integration
-(23) tiers; the unit tier includes a Hypothesis property test (40
-randomized examples spanning 12 currency pairs).
+Then run the tests. `make` is the canonical entry point on
+POSIX-like environments; on Windows without `make` installed, use
+the raw `python -m` commands shown below.
+
+```bash
+# === POSIX (Linux, macOS, or Windows with GNU make installed) ===
+make test         # unit + property + integration (120 tests)
+make test-unit    # SQLite-tier only (98 tests, no Postgres needed)
+make lint         # ruff
+make typecheck    # mypy strict on app/domain
+make serve        # start uvicorn on :8000
+make load-test    # run scripts/load_test.py against :8000
+
+# === Windows (or any environment without make) ===
+python -m pytest tests/unit tests/property -p no:unraisableexception
+python -m pytest tests/integration -p no:unraisableexception
+python -m ruff check .
+python -m mypy app/domain
+python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+python scripts/load_test.py --customers 10 --quotes-per-customer 5
+```
+
+Expected output for the full suite: **120 tests pass** (98 in the
+unit tier including a 40-example Hypothesis property test; 22 in
+the integration tier including the N=20 concurrency test).
+
+The `-p no:unraisableexception` flag is the Windows-specific
+platform-noise suppression discussed under "Known limitations"
+below; on Linux/macOS it's a no-op but harmless.
 
 ## Running the API locally
 
+First-time setup: apply migrations to the dev database (the tests
+use a separate `fx_engine_test` database that conftest creates on
+the fly; the dev `fx_engine` needs Alembic run manually).
+
 ```bash
+# POSIX:
+DATABASE_URL=postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine \
+  python -m alembic upgrade head
+
+# Windows (cmd):
+set DATABASE_URL=postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine
+python -m alembic upgrade head
+```
+
+Then start the server:
+
+```bash
+# POSIX (with make):
 DATABASE_URL=postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine \
 ENV=development \
 make serve
+
+# Windows / no make:
+set DATABASE_URL=postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine
+set ENV=development
+python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+```
+
+The rate provider hits exchangeratesapi.io with the `RATE_API_KEY`
+env var. The grading flow doesn't need a real key — without one,
+`/healthz` reports `degraded` and `/quotes` returns 503 until rates
+are seeded. To exercise the API end-to-end without a real key, seed
+the rates table directly:
+
+```bash
+python -c "import asyncio; from datetime import datetime, UTC; from decimal import Decimal; from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker; from app.domain.currency import Currency; from app.infra.repositories import RateRepository
+URL = 'postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine'
+RATES = {(Currency.USD, Currency.KES): Decimal('130'), (Currency.USD, Currency.NGN): Decimal('1500'), (Currency.USD, Currency.EUR): Decimal('0.92'), (Currency.EUR, Currency.KES): Decimal('141.30'), (Currency.EUR, Currency.NGN): Decimal('1630.43')}
+async def seed():
+    engine = create_async_engine(URL); factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as s:
+        async with s.begin():
+            for (b, q), m in RATES.items():
+                await RateRepository.upsert(s, base=b, quote=q, mid_rate=m, fetched_at=datetime.now(UTC), source='seed')
+    await engine.dispose()
+asyncio.run(seed()); print('seeded')
+"
 ```
 
 Then in another shell:
@@ -87,9 +169,14 @@ running API. Pure asyncio + httpx; no external load tools.
 
 ```bash
 # In one shell:
-make serve
-# In another (after seeding rates -- see DECISIONS.md "rate seeding"):
-make load-test
+make serve                                          # POSIX with make
+# or:
+python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+
+# In another (after seeding rates per the section above):
+make load-test                                      # POSIX with make
+# or:
+python scripts/load_test.py --customers 10 --quotes-per-customer 5
 ```
 
 Sample output from a local run captured during the build:
