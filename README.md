@@ -116,22 +116,15 @@ The rate provider hits exchangeratesapi.io with the `RATE_API_KEY`
 env var. The grading flow doesn't need a real key — without one,
 `/healthz` reports `degraded` and `/quotes` returns 503 until rates
 are seeded. To exercise the API end-to-end without a real key, seed
-the rates table directly:
+the rates table from the helper script:
 
 ```bash
-python -c "import asyncio; from datetime import datetime, UTC; from decimal import Decimal; from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker; from app.domain.currency import Currency; from app.infra.repositories import RateRepository
-URL = 'postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine'
-RATES = {(Currency.USD, Currency.KES): Decimal('130'), (Currency.USD, Currency.NGN): Decimal('1500'), (Currency.USD, Currency.EUR): Decimal('0.92'), (Currency.EUR, Currency.KES): Decimal('141.30'), (Currency.EUR, Currency.NGN): Decimal('1630.43')}
-async def seed():
-    engine = create_async_engine(URL); factory = async_sessionmaker(engine, expire_on_commit=False)
-    async with factory() as s:
-        async with s.begin():
-            for (b, q), m in RATES.items():
-                await RateRepository.upsert(s, base=b, quote=q, mid_rate=m, fetched_at=datetime.now(UTC), source='seed')
-    await engine.dispose()
-asyncio.run(seed()); print('seeded')
-"
+python scripts/seed_rates.py
+# seeded 5 rates into postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine
 ```
+
+The script writes five mid rates (USD↔{KES,NGN,EUR} plus the EUR
+crosses). It honours `DATABASE_URL` if set.
 
 Then in another shell:
 
@@ -167,13 +160,18 @@ latency, idempotent-replay count).
 `scripts/load_test.py` runs a small concurrent workload against a
 running API. Pure asyncio + httpx; no external load tools.
 
+It requires the server to already be running in another shell and
+rates to be seeded. Killing the server before launching the load
+test surfaces as `httpx.ConnectError: All connection attempts failed`.
+
 ```bash
-# In one shell:
+# Shell 1 -- start the server (keep this running):
 make serve                                          # POSIX with make
 # or:
 python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 
-# In another (after seeding rates per the section above):
+# Shell 2 -- seed rates once, then run the load test:
+python scripts/seed_rates.py
 make load-test                                      # POSIX with make
 # or:
 python scripts/load_test.py --customers 10 --quotes-per-customer 5
@@ -341,22 +339,25 @@ A few things worth surfacing explicitly (the assignment's
   agent's pre-implementation read-back surfaced twelve clarifications,
   SPEC v0.2 landed as its own commit. Implementation followed in
   scoped, reviewable steps with explicit acceptance criteria.
-- **The strongest single technical artefact is the SPEC §7
-  deviation** in `app/services/execute.py`. The orchestrator's
-  docstring restates the spec step-for-step, then explicitly notes
-  the deviation (lock the quote BEFORE inserting executions) and
-  explains the FK-vs-FOR-UPDATE deadlock reasoning. The N=20
-  graded test on Postgres surfaced the deadlock; a less-thorough
-  N=2 test would have masked it. Documented in DECISIONS.md.
-- **Four real bugs were caught by strict tooling during the
-  build.** Listed in DECISIONS.md under "What I did not trust
-  without verifying." That thread is the answer to "tell me how
-  you work with AI tools."
-- **The planted-bugs review found a 17,000× cross-pair routing
-  bug** that survives the planted suite's own tests because the
-  suite uses a MagicMock provider and only asserts `rate > 0`. A
-  passing test that doesn't exercise the failure mode is worse
-  than no test. Captured in REVIEW.md and discussed in DECISIONS.md.
+- **One technical decision worth scrutinising is the SPEC §7
+  step-ordering deviation** in `app/services/execute.py`. The
+  orchestrator's docstring restates the spec step-for-step and
+  explains why this implementation locks the quote *before*
+  inserting the executions row, contrary to the spec's literal
+  order. The N=20 concurrency test on Postgres surfaced the
+  deadlock the literal ordering would have produced; the
+  FK-vs-FOR-UPDATE reasoning is documented inline and in
+  DECISIONS.md.
+- **Strict tooling caught four real bugs during the build.**
+  Listed in DECISIONS.md under "What I did not trust without
+  verifying." That thread is what I would point at if asked how
+  I work with AI tools.
+- **The planted-bugs review identifies nine bugs ranked by
+  production impact.** The most severe is a cross-pair routing
+  inversion that produces ~17,000× the correct rate; it survives
+  the planted suite's own tests because the suite uses a
+  MagicMock provider and only asserts `rate > 0`. Captured in
+  REVIEW.md.
 - **One process slip surfaced honestly.** During the planted-bugs
   review I `cd`'d into `planted_bugs/` and inadvertently modified
   its `.gitignore` (a CLAUDE.md §7 read-only-rule violation).
