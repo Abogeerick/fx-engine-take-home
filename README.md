@@ -82,6 +82,114 @@ The `-p no:unraisableexception` flag is the Windows-specific
 platform-noise suppression discussed under "Known limitations"
 below; on Linux/macOS it's a no-op but harmless.
 
+## End-to-end demo (two shells)
+
+A linear script that takes a fresh checkout through tests, server,
+and a real quote → execute → balance flow. Follow the steps in
+order. **Two shells are required** — the server runs in shell 1
+and stays running; everything else happens in shell 2. Killing the
+server before running the curl flow or the load test surfaces as
+`httpx.ConnectError: All connection attempts failed`.
+
+### Shell 2 — verification (run these first)
+
+```bash
+# 1. Full test suite — 120 tests across three tiers (~20s)
+python -m pytest tests/unit tests/property tests/integration \
+  -p no:unraisableexception
+
+# 2. Lint clean
+python -m ruff check .
+
+# 3. Type-check strict on the domain layer
+python -m mypy app/domain
+```
+
+Expected: `120 passed`, `All checks passed!`, `Success: no issues
+found in 8 source files`. The full suite covers the SPEC §12 graded
+tests (Hypothesis property, N=20 concurrency, M=10 byte-identical
+replay, sticky failure, atomicity, stale rate, cross-pair routing,
+quote ownership, currency casing).
+
+### Shell 2 — one-time DB setup
+
+```bash
+# Apply migrations to the dev database (test DB is handled by
+# conftest; dev DB needs this run manually on first checkout).
+export DATABASE_URL=postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine
+python -m alembic upgrade head
+
+# Seed five mid rates so /quotes works without a real RATE_API_KEY.
+python scripts/seed_rates.py
+# seeded 5 rates into postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine
+```
+
+### Shell 1 — start the server (leave this running)
+
+```bash
+export DATABASE_URL=postgresql+asyncpg://fx:devpass@localhost:5433/fx_engine
+export ENV=development
+python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+```
+
+Wait for `Uvicorn running on http://127.0.0.1:8000`. Leave the
+window open. Every subsequent step happens in shell 2.
+
+### Shell 2 — quote → execute → balance (the headline demo)
+
+```bash
+# 1. Health check
+curl -s localhost:8000/healthz | python -m json.tool
+# {"status": "ok", "rate_cache_age_seconds": ..., "rate_source_state": "fresh"}
+
+# 2. Create a customer and capture the id
+CID=$(curl -s -X POST localhost:8000/customers \
+  -H 'content-type: application/json' -d '{}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['customer_id'])")
+echo "customer: $CID"
+
+# 3. Fund the customer with 1000 USD
+curl -s -X POST "localhost:8000/customers/$CID/credit" \
+  -H 'content-type: application/json' \
+  -d '{"currency":"USD","amount":"1000"}' | python -m json.tool
+
+# 4. Generate a quote and capture the id
+QUOTE=$(curl -s -X POST localhost:8000/quotes \
+  -H 'content-type: application/json' \
+  -d "{\"customer_id\":\"$CID\",\"from_currency\":\"USD\",\"to_currency\":\"KES\",\"from_amount\":\"100\"}")
+echo "$QUOTE" | python -m json.tool
+QID=$(echo "$QUOTE" | python -c "import sys,json;print(json.load(sys.stdin)['quote_id'])")
+
+# 5. Execute the quote
+curl -s -X POST localhost:8000/executions \
+  -H 'content-type: application/json' \
+  -d "{\"quote_id\":\"$QID\",\"customer_id\":\"$CID\",\"idempotency_key\":\"demo-001\"}" \
+  | python -m json.tool
+# 201 with debited / credited / balances_after
+
+# 6. Retry with the same idempotency key — byte-identical replay, HTTP 200
+curl -s -X POST localhost:8000/executions \
+  -H 'content-type: application/json' \
+  -d "{\"quote_id\":\"$QID\",\"customer_id\":\"$CID\",\"idempotency_key\":\"demo-001\"}" \
+  | python -m json.tool
+
+# 7. Balance changed exactly once
+curl -s "localhost:8000/customers/$CID/balances" | python -m json.tool
+# {"USD": "900.00", "KES": "12935.00"}
+```
+
+### Shell 2 — load test (optional)
+
+```bash
+# Server must still be running in shell 1.
+python scripts/load_test.py --customers 10 --quotes-per-customer 5
+```
+
+Expected: 50 quote requests + 50 execute requests, 0 errors,
+sub-second wall time on a modern laptop.
+
+---
+
 ## Running the API locally
 
 First-time setup: apply migrations to the dev database (the tests
